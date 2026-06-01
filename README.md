@@ -6,6 +6,8 @@
 ## What It Is For
 Use it to let an MCP client diagnose server issues, inspect logs, fetch resource usage, list backups, and run safe operational queries without building a full custom control panel integration.
 
+Spark profiles are parsed locally inside this MCP server. `.sparkprofile` is a binary Protobuf format, not a text report.
+
 ## Installation
 ```powershell
 python -m venv .venv
@@ -75,12 +77,16 @@ Dangerous or higher risk:
 ## Lag Diagnosis
 `ptero_lag_diagnose` cruza Spark profiles com configs, logs, startup e recursos atuais para gerar um relatorio de causa provavel, evidencias, hotspots e recomendacoes praticas.
 
+O parser local usa o schema oficial do `lucko/spark-viewer` para ler `.sparkprofile` como Protobuf binario. O arquivo [spark_pb2.py](D:/jogos/Dev%20Mine/mc-remote-agent/spark_pb2.py) foi gerado a partir do schema versionado em [spark.proto](D:/jogos/Dev%20Mine/mc-remote-agent/spark.proto).
+
 Spark files aceitos:
 
 - `.sparkprofile`
 - `.sparkprofiler` como alias de `.sparkprofile`
 - `.sparkheap`
 - `.sparkhealth`
+
+`.sparkprofiler` e aceito por compatibilidade, mas a extensao oficial comum do profiler e `.sparkprofile`.
 
 Fluxo recomendado:
 
@@ -89,7 +95,9 @@ Fluxo recomendado:
    `/spark profiler stop --save-to-file`
 2. Liste os arquivos:
    `ptero_spark_list_profiles`
-3. Rode o diagnostico completo:
+3. Analise o profile com parser estruturado:
+   `ptero_spark_analyze_profile`
+4. Rode o diagnostico completo:
    `ptero_lag_diagnose`
 
 Exemplo de uso:
@@ -109,3 +117,12 @@ Exemplo de uso:
 ```
 
 Se quiser uma leitura mais curta do profile antes do diagnostico completo, use `ptero_spark_hotspots` ou `ptero_spark_analyze_profile`.
+
+## Spark Developer API
+A Spark Developer API e diferente da analise de `.sparkprofile`.
+
+- A Developer API serve para metricas live dentro de um plugin/mod Java rodando no servidor.
+- Ela pode expor TPS, MSPT, CPU, GC e placeholders em tempo real.
+- Ela nao substitui a analise local de `.sparkprofile`, porque nao entrega a arvore completa do profiler, `classSources`, `self time` e `inclusive time`.
+
+Este projeto nao cria bridge Java extra nesta etapa. Um futuro `SparkMcpBridge.jar` poderia expor metricas live em JSON, mas isso e separado do parser local de Spark profiles.

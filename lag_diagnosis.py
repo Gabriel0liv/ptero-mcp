@@ -177,6 +177,7 @@ async def collect_relevant_configs(list_dir, read_text, include_coreprotect: boo
     findings = []
     scores = defaultdict(int)
     issues = []
+    parsed_server_properties = {}
     config_paths = await _resolve_config_candidates(list_dir)
 
     for path in config_paths:
@@ -193,6 +194,7 @@ async def collect_relevant_configs(list_dir, read_text, include_coreprotect: boo
 
         if lower.endswith("/server.properties") or lower == "/server.properties":
             props = _parse_server_properties(text)
+            parsed_server_properties = props
             summary_bits = []
             for key in (
                 "view-distance",
@@ -274,6 +276,7 @@ async def collect_relevant_configs(list_dir, read_text, include_coreprotect: boo
         "findings": findings,
         "scores": dict(scores),
         "issues": issues,
+        "parsed_server_properties": parsed_server_properties,
     }
 
 
@@ -438,14 +441,21 @@ def build_final_report(profile_analysis: dict, config_data: dict, log_data: dict
         "## Resumo",
         f"Causa provavel: {probable_cause}",
         f"Confianca: {confidence}",
+        f"Parser Spark: {'Protobuf estruturado' if profile_analysis.get('structured') else 'Fallback heuristico'}",
         "",
         "## Evidencias principais",
     ]
 
     evidence_lines = []
-    if profile_analysis.get("hotspots"):
-        first = profile_analysis["hotspots"][0]
-        evidence_lines.append(f"Spark: {first['label']} apareceu como hotspot principal com score {first['score']}.")
+    if profile_analysis.get("main_thread_hotspots"):
+        first = profile_analysis["main_thread_hotspots"][0]
+        evidence_lines.append(f"Spark/main thread: {first['name']} [{first.get('source_name', 'desconhecido')}] apareceu entre os principais hotspots.")
+    elif profile_analysis.get("hotspots_total"):
+        first = profile_analysis["hotspots_total"][0]
+        if "label" in first:
+            evidence_lines.append(f"Spark: {first['label']} apareceu como hotspot principal com score {first.get('score', 0)}.")
+        else:
+            evidence_lines.append(f"Spark: {first['name']} [{first.get('source_name', 'desconhecido')}] apareceu como hotspot principal.")
     if config_data.get("issues"):
         evidence_lines.append(f"Config: {config_data['issues'][0]}")
     if log_data.get("findings"):
@@ -458,12 +468,17 @@ def build_final_report(profile_analysis: dict, config_data: dict, log_data: dict
         lines.append(f"{idx}. {line}")
 
     lines.extend(["", "## Hotspots do Spark"])
-    if profile_analysis.get("hotspots"):
-        for hotspot in profile_analysis["hotspots"][:10]:
-            examples = ", ".join(hotspot.get("examples", [])[:4]) or "sem exemplos"
-            lines.append(f"- {hotspot['label']}: score {hotspot['score']} ({examples})")
+    if profile_analysis.get("hotspots_total"):
+        for hotspot in profile_analysis["hotspots_total"][:10]:
+            if "label" in hotspot:
+                examples = ", ".join(hotspot.get("examples", [])[:4]) or "sem exemplos"
+                lines.append(f"- {hotspot['label']}: score {hotspot['score']} ({examples})")
+            else:
+                lines.append(
+                    f"- {hotspot['name']} [{hotspot.get('source_name', 'desconhecido')}]: total={hotspot.get('inclusive_time', 0.0):.1f}, self={hotspot.get('self_time', 0.0):.1f}"
+                )
     else:
-        lines.append("- O profile Spark nao mostrou hotspots fortes por heuristica.")
+        lines.append("- O profile Spark nao mostrou hotspots fortes.")
 
     lines.extend(["", "## Configuracoes relevantes encontradas"])
     config_findings = config_data.get("findings", [])
@@ -477,6 +492,18 @@ def build_final_report(profile_analysis: dict, config_data: dict, log_data: dict
             lines.append(f"- {finding}")
     if startup_command:
         lines.append(f"- Startup bruto: {startup_command[:220]}")
+
+    embedded_props = profile_analysis.get("server_properties_embedded", {})
+    current_props = config_data.get("parsed_server_properties", {})
+    if isinstance(embedded_props, dict) and embedded_props and current_props:
+        divergence_lines = []
+        for key in ("view-distance", "simulation-distance", "max-players", "sync-chunk-writes", "max-tick-time"):
+            if key in embedded_props and key in current_props and str(embedded_props[key]) != str(current_props[key]):
+                divergence_lines.append(
+                    f"Atenção: o profile foi gerado com {key}={embedded_props[key]}, mas a config atual parece {key}={current_props[key]}."
+                )
+        for item in divergence_lines[:5]:
+            lines.append(f"- {item}")
 
     lines.extend(["", "## Possiveis causas"])
     if probable:
@@ -503,6 +530,15 @@ def build_final_report(profile_analysis: dict, config_data: dict, log_data: dict
         recommendations.append("Revise heap, Xms/Xmx e flags JVM antes de aumentar memoria cegamente.")
     if "disk_io" in merged_scores:
         recommendations.append("Cheque saves, backups, filas de banco e armazenamento subjacente durante o horario do lag.")
+    if profile_analysis.get("structured") and profile_analysis.get("main_thread"):
+        idle_ratio = 0.0
+        total_time = profile_analysis["main_thread"].get("total_time", 0.0)
+        if total_time:
+            idle_ratio = min(1.0, profile_analysis["main_thread"].get("idle_time", 0.0) / total_time)
+        if idle_ratio > 0.40:
+            recommendations.append("A main thread passou bastante tempo em espera; confirme se o profile foi capturado exatamente durante o pico de lag.")
+        else:
+            recommendations.append("O profile mostra a main thread ocupada; priorize primeiro os hotspots da Server thread antes de otimizar threads async.")
     seen = set()
     unique_recommendations = []
     for item in recommendations:
