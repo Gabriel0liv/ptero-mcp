@@ -23,8 +23,7 @@ def is_safe_select_query(query: str) -> bool:
     if not cleaned:
         return False
 
-    allowed_starts = ("select", "show", "describe", "explain")
-    if not any(cleaned.startswith(start) for start in allowed_starts):
+    if not re.match(r"^(select|show|describe|explain)\b", cleaned):
         return False
 
     dangerous_keywords = {

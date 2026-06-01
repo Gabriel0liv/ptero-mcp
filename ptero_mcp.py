@@ -905,7 +905,9 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
 
         if name == "ptero_databases":
             include_password = bool(arguments.get("include_password", False))
-            data = await run_blocking(api_get_json, f"/api/client/servers/{SERVER}/databases", {"include": "password"})
+            should_fetch_password = include_password and ALLOW_DATABASE_PASSWORDS
+            params = {"include": "password"} if should_fetch_password else {}
+            data = await run_blocking(api_get_json, f"/api/client/servers/{SERVER}/databases", params)
             out = []
             blocked_password_message = None
             if include_password and not ALLOW_DATABASE_PASSWORDS:
@@ -919,7 +921,7 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                 host_str = f"{host_info.get('address')}:{host_info.get('port')}"
                 
                 pwd_val = "[REDACTED]"
-                if include_password and ALLOW_DATABASE_PASSWORDS:
+                if should_fetch_password:
                     rel = attrs.get("relationships", {})
                     pwd_obj = rel.get("password", {})
                     pwd_attrs = pwd_obj.get("attributes", {})

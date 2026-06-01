@@ -27,6 +27,7 @@ Optional:
 - `ALLOW_DATABASE_PASSWORDS`: set to `1` to reveal real DB passwords when `include_password=true`
 
 See `.env.example` for a safe template.
+The project does not load `.env` automatically; in normal MCP usage, variables are passed by `.mcp.json` or the client-specific MCP configuration.
 
 ## MCP Configuration Example
 Use `.mcp.example.json` as a starting point:
