@@ -14,9 +14,11 @@ import pymysql
 
 import mcp.types as types
 import mcp.server.stdio
+from lag_diagnosis import DEFAULT_PROFILE_SEARCH_DIRS, list_spark_profiles, run_lag_diagnosis
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from safety import is_safe_select_query, is_shell_command, mark_untrusted_text, zip_safe_member
+from spark_profile import analyze_spark_bytes, detect_spark_type, format_profile_analysis
 
 PANEL = os.environ["PTERO_PANEL"].rstrip("/")
 KEY = os.environ["PTERO_KEY"].strip()
@@ -219,6 +221,44 @@ async def download_zip_to_temp(zip_file: str, max_download_mb: int) -> str:
     return await download_to_temp(zip_file, max_download_mb, suffix=".zip")
 
 
+async def remote_list_directory(directory: str) -> list[dict]:
+    directory = norm_path(directory, default="/")
+    data = await asyncio.to_thread(api_get_json, f"/api/client/servers/{SERVER}/files/list", {"directory": directory})
+    items = []
+    for item in data.get("data", []):
+        attrs = item.get("attributes", {})
+        name = attrs.get("name", "")
+        path = f"{directory.rstrip('/')}/{name}" if directory != "/" else f"/{name}"
+        items.append(
+            {
+                "name": name,
+                "path": path,
+                "is_file": attrs.get("is_file", True),
+                "size": attrs.get("size", 0),
+                "modified_at": attrs.get("modified_at"),
+            }
+        )
+    return items
+
+
+async def remote_read_text_raw(file_path: str) -> str:
+    file_path = norm_path(file_path, default="/")
+    return await asyncio.to_thread(api_get_text, f"/api/client/servers/{SERVER}/files/contents", {"file": file_path})
+
+
+async def remote_download_temp(file_path: str, max_download_mb: int, suffix: str = ".tmp") -> str:
+    file_path = norm_path(file_path, default="/")
+    return await download_to_temp(file_path, max_download_mb, suffix=suffix)
+
+
+async def fetch_resources_payload() -> dict:
+    return await asyncio.to_thread(api_get_json, f"/api/client/servers/{SERVER}/resources", {})
+
+
+async def fetch_startup_payload() -> dict:
+    return await asyncio.to_thread(api_get_json, f"/api/client/servers/{SERVER}/startup", {})
+
+
 
 async def ws_get_token_and_socket() -> tuple[str, str]:
     """
@@ -342,6 +382,63 @@ async def list_tools() -> list[types.Tool]:
             name="ptero_download_url",
             description="Gera um URL assinado para baixar um arquivo (Client API files/download).",
             inputSchema={"type": "object", "properties": {"file": {"type": "string"}}, "required": ["file"]},
+        ),
+        types.Tool(
+            name="ptero_spark_list_profiles",
+            description="Lista profiles do Spark em diretorios comuns, procurando recursivamente com profundidade limitada.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "directories": {"type": "array", "items": {"type": "string"}, "default": list(DEFAULT_PROFILE_SEARCH_DIRS)},
+                    "max_depth": {"type": "integer", "default": 4},
+                    "max_results": {"type": "integer", "default": 100},
+                },
+            },
+        ),
+        types.Tool(
+            name="ptero_spark_analyze_profile",
+            description="Analisa um profile do Spark e retorna resumo, hotspots, causas provaveis e recomendacoes.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "top_n": {"type": "integer", "default": 30},
+                    "max_depth": {"type": "integer", "default": 12},
+                    "max_download_mb": {"type": "integer", "default": 200},
+                },
+                "required": ["file"],
+            },
+        ),
+        types.Tool(
+            name="ptero_spark_hotspots",
+            description="Versao curta da analise Spark, retornando apenas os maiores gargalos e pistas principais.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "top_n": {"type": "integer", "default": 15},
+                    "max_download_mb": {"type": "integer", "default": 200},
+                },
+                "required": ["file"],
+            },
+        ),
+        types.Tool(
+            name="ptero_lag_diagnose",
+            description="Gera um diagnostico completo de lag cruzando Spark, configs, logs, startup e recursos.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "spark_file": {"type": "string", "default": ""},
+                    "profile_search_dirs": {"type": "array", "items": {"type": "string"}, "default": list(DEFAULT_PROFILE_SEARCH_DIRS)},
+                    "include_configs": {"type": "boolean", "default": True},
+                    "include_logs": {"type": "boolean", "default": True},
+                    "include_coreprotect": {"type": "boolean", "default": False},
+                    "log_lines": {"type": "integer", "default": 500},
+                    "top_n": {"type": "integer", "default": 25},
+                    "max_depth": {"type": "integer", "default": 12},
+                    "max_download_mb": {"type": "integer", "default": 200},
+                },
+            },
         ),
         types.Tool(
             name="ptero_zip_list",
@@ -543,6 +640,93 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
             file = norm_path(str(arguments["file"]), default="/")
             url = await get_signed_download_url(file)
             return types.CallToolResult(content=[types.TextContent(type="text", text=url)])
+
+        if name == "ptero_spark_list_profiles":
+            directories = arguments.get("directories") or list(DEFAULT_PROFILE_SEARCH_DIRS)
+            max_depth = int(arguments.get("max_depth", 4))
+            max_results = int(arguments.get("max_results", 100))
+            profiles = await list_spark_profiles(
+                remote_list_directory,
+                directories=[norm_path(str(directory), default="/") for directory in directories],
+                max_depth=max_depth,
+                max_results=max_results,
+            )
+            if not profiles:
+                return types.CallToolResult(content=[types.TextContent(type="text", text="Nenhum profile Spark foi encontrado nos diretorios informados.")])
+            lines = []
+            for profile in profiles:
+                lines.append(
+                    "\t".join(
+                        [
+                            profile["path"],
+                            profile["name"],
+                            profile["type"],
+                            str(profile.get("size", 0)),
+                            str(profile.get("modified_at") or ""),
+                        ]
+                    )
+                )
+            return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(lines))])
+
+        if name == "ptero_spark_analyze_profile":
+            file = norm_path(str(arguments["file"]), default="/")
+            top_n = int(arguments.get("top_n", 30))
+            max_depth = int(arguments.get("max_depth", 12))
+            max_download_mb = int(arguments.get("max_download_mb", 200))
+            tmp_path = await remote_download_temp(file, max_download_mb, suffix=os.path.splitext(file)[1] or ".spark")
+            try:
+                with open(tmp_path, "rb") as handle:
+                    analysis = analyze_spark_bytes(file, handle.read(), top_n=top_n, max_depth=max_depth)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            return types.CallToolResult(content=[types.TextContent(type="text", text=format_profile_analysis(analysis, short=False, top_n=top_n))])
+
+        if name == "ptero_spark_hotspots":
+            file = norm_path(str(arguments["file"]), default="/")
+            top_n = int(arguments.get("top_n", 15))
+            max_download_mb = int(arguments.get("max_download_mb", 200))
+            tmp_path = await remote_download_temp(file, max_download_mb, suffix=os.path.splitext(file)[1] or ".spark")
+            try:
+                with open(tmp_path, "rb") as handle:
+                    analysis = analyze_spark_bytes(file, handle.read(), top_n=top_n, max_depth=12)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+            return types.CallToolResult(content=[types.TextContent(type="text", text=format_profile_analysis(analysis, short=True, top_n=top_n))])
+
+        if name == "ptero_lag_diagnose":
+            spark_file = str(arguments.get("spark_file", "")).strip()
+            profile_search_dirs = arguments.get("profile_search_dirs") or list(DEFAULT_PROFILE_SEARCH_DIRS)
+            include_configs = bool(arguments.get("include_configs", True))
+            include_logs = bool(arguments.get("include_logs", True))
+            include_coreprotect = bool(arguments.get("include_coreprotect", False))
+            log_lines = int(arguments.get("log_lines", 500))
+            top_n = int(arguments.get("top_n", 25))
+            max_depth = int(arguments.get("max_depth", 12))
+            max_download_mb = int(arguments.get("max_download_mb", 200))
+
+            diagnosis = await run_lag_diagnosis(
+                spark_file=norm_path(spark_file, default="") if spark_file else "",
+                list_dir=remote_list_directory,
+                read_text=remote_read_text_raw,
+                download_file=remote_download_temp,
+                fetch_resources=fetch_resources_payload,
+                fetch_startup=fetch_startup_payload,
+                include_configs=include_configs,
+                include_logs=include_logs,
+                include_coreprotect=include_coreprotect,
+                profile_search_dirs=[norm_path(str(directory), default="/") for directory in profile_search_dirs],
+                log_lines=log_lines,
+                top_n=top_n,
+                max_depth=max_depth,
+                max_download_mb=max_download_mb,
+            )
+            return types.CallToolResult(content=[types.TextContent(type="text", text=diagnosis["report"])])
 
         if name == "ptero_zip_list":
             zip_file = norm_path(str(arguments["zip_file"]), default="/")
