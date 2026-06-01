@@ -20,6 +20,7 @@ dist/
 # Local environment and secrets
 .env
 .env.*
+!.env.example
 .mcp.json
 
 # Editor and OS files
@@ -29,4 +30,4 @@ Thumbs.db
 .DS_Store
 
 .claude
-agents.md
+AGENTS.md

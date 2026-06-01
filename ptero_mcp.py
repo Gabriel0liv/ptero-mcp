@@ -16,6 +16,7 @@ import mcp.types as types
 import mcp.server.stdio
 from mcp.server.lowlevel import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
+from safety import is_safe_select_query, is_shell_command, mark_untrusted_text, zip_safe_member
 
 PANEL = os.environ["PTERO_PANEL"].rstrip("/")
 KEY = os.environ["PTERO_KEY"].strip()
@@ -25,6 +26,7 @@ DEFAULT_TIMEOUT = float(os.environ.get("PTERO_TIMEOUT", "30"))
 
 # Safety: block dangerous console commands by default
 ALLOW_DANGEROUS_CONSOLE = os.environ.get("ALLOW_DANGEROUS_CONSOLE", "0") == "1"
+ALLOW_DATABASE_PASSWORDS = os.environ.get("ALLOW_DATABASE_PASSWORDS", "0") == "1"
 DANGEROUS_CMD_RE = re.compile(r"^\s*(stop|restart|end|shutdown)\b", re.IGNORECASE)
 
 
@@ -51,45 +53,6 @@ def get_co_db_config() -> dict:
         "password": parse_yaml_value("mysql-password"),
     }
 
-
-def is_safe_select_query(query: str) -> bool:
-    """Validates if a SQL query is read-only (SELECT, SHOW, DESCRIBE, EXPLAIN)."""
-    # Remove single-line and multi-line comments
-    cleaned = re.sub(r'--.*$', '', query, flags=re.MULTILINE)
-    cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
-    cleaned = cleaned.strip().lower()
-    
-    # Must start with select, show, describe, explain
-    allowed_starts = ("select", "show", "describe", "explain")
-    if not any(cleaned.startswith(start) for start in allowed_starts):
-        return False
-        
-    # Block query chaining or dangerous words (defense in depth)
-    dangerous_keywords = {"insert", "update", "delete", "drop", "truncate", "alter", "create", "replace", "grant", "revoke"}
-    words = set(re.findall(r'\b\w+\b', cleaned))
-    if words.intersection(dangerous_keywords):
-        return False
-        
-    return True
-
-
-def is_shell_command(cmd: str) -> bool:
-    cmd_stripped = cmd.strip()
-    parts = cmd_stripped.split()
-    if not parts:
-        return False
-    first = parts[0].lower().lstrip("/")
-    shell_tools = {"grep", "zgrep", "zcat", "tail", "wc", "cat", "cut", "awk", "sed", "gzip", "gunzip"}
-    if first in shell_tools:
-        return True
-    # Bloqueia operadores se o comando contiver alguma ferramenta de shell (ex: zcat ... | tail -1)
-    operators = {"|", ">", "<", "&&", ";"}
-    has_operator = any(op in cmd_stripped for op in operators)
-    if has_operator:
-        words = {w.lower() for w in parts}
-        if words.intersection(shell_tools):
-            return True
-    return False
 
 ZIP_EXTS = (".zip", ".jar", ".mrpack", ".mcpack", ".resourcepack", ".datapack")
 ZIP_MAGIC = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
@@ -183,16 +146,6 @@ def format_bytes(n: int) -> str:
 
 def is_zip_like_path(path: str) -> bool:
     return path.lower().endswith(ZIP_EXTS)
-
-
-def zip_safe_member(name: str) -> bool:
-    # Prevent ZipSlip-style paths and treat directories like "folder/" as valid.
-    normalized = name.replace("\\", "/")
-    if normalized.startswith("/"):
-        return False
-    parts = [p for p in normalized.split("/") if p]  # drop empty parts from leading/trailing slashes
-    return all(part != ".." for part in parts)
-
 
 
 async def get_signed_download_url(file_path: str) -> str:
@@ -584,7 +537,7 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
             text = await run_blocking(api_get_text, f"/api/client/servers/{SERVER}/files/contents", {"file": file})
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n\n…(cortado)"
-            return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(text))])
 
         if name == "ptero_download_url":
             file = norm_path(str(arguments["file"]), default="/")
@@ -645,7 +598,7 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                     text = raw[:256].hex() + ("\n…(binário)" if len(raw) > 256 else "")
                 if len(text) > max_chars:
                     text = text[:max_chars] + "\n\n…(cortado)"
-                return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+                return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(text))])
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -683,8 +636,9 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                                 matches.append(f"{info.filename}:{idx}: {line}")
                                 if len(matches) >= max_matches:
                                     matches.append("…(limite atingido)")
-                                    return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(matches))])
-                return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(matches) if matches else "(nenhum match)")])
+                                    return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text("\n".join(matches)))])
+                output = "\n".join(matches) if matches else "(nenhum match)"
+                return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(output))])
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -695,7 +649,8 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
             file = norm_path(str(arguments["file"]), default="/logs/latest.log")
             lines = int(arguments.get("lines", 200))
             text = await run_blocking(api_get_text, f"/api/client/servers/{SERVER}/files/contents", {"file": file})
-            return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(text.splitlines()[-lines:]))])
+            output = "\n".join(text.splitlines()[-lines:])
+            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(output))])
 
         if name == "ptero_grep":
             file = norm_path(str(arguments["file"]), default="/logs/latest.log")
@@ -710,7 +665,8 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                     if len(matches) >= max_matches:
                         matches.append("…(limite atingido)")
                         break
-            return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(matches) if matches else "(nenhum match)")])
+            output = "\n".join(matches) if matches else "(nenhum match)"
+            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(output))])
 
         if name == "ptero_gz_grep":
             file_gz = norm_path(str(arguments["file_gz"]), default="/")
@@ -729,7 +685,8 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                             if len(matches) >= max_matches:
                                 matches.append("…(limite atingido)")
                                 break
-                return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(matches) if matches else "(nenhum match)")])
+                output = "\n".join(matches) if matches else "(nenhum match)"
+                return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(output))])
             finally:
                 try:
                     os.unlink(tmp_path)
@@ -765,7 +722,7 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                 pass
                 
             if last_match:
-                return types.CallToolResult(content=[types.TextContent(type="text", text=last_match)])
+                return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(last_match))])
                 
             # Step 2: List and sort rotated logs
             try:
@@ -819,7 +776,7 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                                         found_in_file = f"{full_path}:{i}: {line_strip}"
                                         
                         if found_in_file:
-                            return types.CallToolResult(content=[types.TextContent(type="text", text=found_in_file)])
+                            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(found_in_file))])
                     finally:
                         try:
                             os.unlink(tmp_log)
@@ -829,7 +786,7 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                     # If download/read fails, skip to next file to be resilient
                     continue
                     
-            return types.CallToolResult(content=[types.TextContent(type="text", text=f"Nenhuma desconexão encontrada para o jogador: {player}")])
+            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(f"Nenhuma desconexão encontrada para o jogador: {player}"))])
 
         if name == "ptero_command":
             cmd = str(arguments["command"]).strip()
@@ -881,7 +838,8 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
             finally:
                 await ws.close()
 
-            return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(lines) if lines else "(sem output)")])
+            output = "\n".join(lines) if lines else "(sem output)"
+            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(output))])
 
         if name == "ptero_ws_stats_once":
             timeout_seconds = float(arguments.get("timeout_seconds", 5))
@@ -942,19 +900,26 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
             finally:
                 await ws.close()
 
-            return types.CallToolResult(content=[types.TextContent(type="text", text="\n".join(lines) if lines else "(sem output)")])
+            output = "\n".join(lines) if lines else "(sem output)"
+            return types.CallToolResult(content=[types.TextContent(type="text", text=mark_untrusted_text(output))])
 
         if name == "ptero_databases":
             include_password = bool(arguments.get("include_password", False))
             data = await run_blocking(api_get_json, f"/api/client/servers/{SERVER}/databases", {"include": "password"})
             out = []
+            blocked_password_message = None
+            if include_password and not ALLOW_DATABASE_PASSWORDS:
+                blocked_password_message = (
+                    "BLOQUEADO: include_password=True exige ALLOW_DATABASE_PASSWORDS=1 no ambiente "
+                    "para revelar a senha real."
+                )
             for db in data.get("data", []):
                 attrs = db.get("attributes", {})
                 host_info = attrs.get("host", {})
                 host_str = f"{host_info.get('address')}:{host_info.get('port')}"
                 
                 pwd_val = "[REDACTED]"
-                if include_password:
+                if include_password and ALLOW_DATABASE_PASSWORDS:
                     rel = attrs.get("relationships", {})
                     pwd_obj = rel.get("password", {})
                     pwd_attrs = pwd_obj.get("attributes", {})
@@ -967,7 +932,10 @@ async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
                     f"  Connections From: {attrs.get('connections_from')}",
                     f"  Password: {pwd_val}",
                 ]))
-            return types.CallToolResult(content=[types.TextContent(type="text", text="\n\n".join(out) if out else "(nenhum banco de dados criado)")])
+            output = "\n\n".join(out) if out else "(nenhum banco de dados criado)"
+            if blocked_password_message:
+                output = f"{blocked_password_message}\n\n{output}"
+            return types.CallToolResult(content=[types.TextContent(type="text", text=output)])
 
         if name == "ptero_backups":
             data = await run_blocking(api_get_json, f"/api/client/servers/{SERVER}/backups", {})
